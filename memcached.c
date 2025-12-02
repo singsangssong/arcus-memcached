@@ -344,6 +344,14 @@ static void settings_init(void)
     settings.access = 0700;
     settings.port = 11211;
     settings.udpport = 0;
+    settings.maxcore = 0;
+    settings.daemonize = false;
+    settings.lock_memory = false;
+    settings.preallocate = false;
+    settings.username = NULL;
+    settings.pid_file = NULL;
+    settings.engine_path = NULL;
+    settings.engine_config = NULL;
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
     settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
@@ -15852,15 +15860,156 @@ static void close_listen_sockets(void)
     }
 }
 
+#define EXTENSION_PATH_MAX_SIZE 5
+
+typedef struct {
+    char **config_file_malloced;
+    int *malloced_count;
+#ifdef ENABLE_ZK_INTEGRATION
+    int *arcus_zk_to;
+#ifdef PROXY_SUPPORT
+    char **arcus_proxy_cfg;
+#endif
+#endif
+} config_opt_t;
+
+static int try_load_config_file(const char *path, config_opt_t *opt)
+{
+    char *access_mask_str = NULL;
+    char *protocol_str = NULL;
+    char *extension_path[EXTENSION_PATH_MAX_SIZE] = {NULL, };
+
+    struct config_item main_config_items[] = {
+        { .key = "port",             .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.port },
+        { .key = "udpport",          .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.udpport },
+        { .key = "socketpath",       .datatype = DT_STRING, .value.dt_string = &settings.socketpath },
+        { .key = "access",           .datatype = DT_STRING, .value.dt_string = &access_mask_str },
+        { .key = "listen",           .datatype = DT_STRING, .value.dt_string = &settings.inter },
+        { .key = "daemonize",        .datatype = DT_BOOL,   .value.dt_bool   = &settings.daemonize },
+        { .key = "maxcore",          .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.maxcore },
+        { .key = "username",         .datatype = DT_STRING, .value.dt_string = &settings.username },
+        { .key = "maxconns",         .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.maxconns },
+        { .key = "lock_memory",      .datatype = DT_BOOL,   .value.dt_bool   = &settings.lock_memory },
+        { .key = "verbosity",        .datatype = DT_SIZE,   .value.dt_size   = (size_t*)&settings.verbose },
+        { .key = "pid_file",         .datatype = DT_STRING, .value.dt_string = &settings.pid_file },
+        { .key = "threads",          .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.num_threads },
+        { .key = "reqs_per_event",   .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.reqs_per_event },
+        { .key = "backlog",          .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.backlog },
+        { .key = "protocol",         .datatype = DT_STRING, .value.dt_string = &protocol_str },
+        { .key = "engine_path",      .datatype = DT_STRING, .value.dt_string = &settings.engine_path },
+        { .key = "memory_limit",     .datatype = DT_SIZE,   .value.dt_size   = &settings.maxbytes },
+        { .key = "eviction",         .datatype = DT_BOOL,   .value.dt_bool   = (bool*)&settings.evict_to_free },
+        { .key = "sticky_limit",     .datatype = DT_SIZE,   .value.dt_size   = &settings.sticky_limit },
+        { .key = "factor",           .datatype = DT_FLOAT,  .value.dt_float  = (float*)&settings.factor },
+        { .key = "chunk_size",       .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)&settings.chunk_size },
+        { .key = "prefix_delimiter", .datatype = DT_CHAR,   .value.dt_char   = &settings.prefix_delimiter },
+        { .key = "detail_enabled",   .datatype = DT_BOOL,   .value.dt_bool   = (bool*)&settings.detail_enabled },
+        { .key = "use_cas",          .datatype = DT_BOOL,   .value.dt_bool   = &settings.use_cas },
+        { .key = "item_size_max",    .datatype = DT_SIZE,   .value.dt_size   = &settings.item_size_max },
+        { .key = "allow_detailed",   .datatype = DT_BOOL,   .value.dt_bool   = &settings.allow_detailed },
+        { .key = "engine_config",    .datatype = DT_STRING, .value.dt_string = &settings.engine_config },
+        { .key = "preallocate",      .datatype = DT_BOOL,   .value.dt_bool   = &settings.preallocate },
+        { .key = "extension1",       .datatype = DT_STRING, .value.dt_string = &extension_path[0] },
+        { .key = "extension2",       .datatype = DT_STRING, .value.dt_string = &extension_path[1] },
+        { .key = "extension3",       .datatype = DT_STRING, .value.dt_string = &extension_path[2] },
+        { .key = "extension4",       .datatype = DT_STRING, .value.dt_string = &extension_path[3] },
+        { .key = "extension5",       .datatype = DT_STRING, .value.dt_string = &extension_path[4] },
+#ifdef ENABLE_ZK_INTEGRATION
+        { .key = "zookeeper",       .datatype = DT_STRING, .value.dt_string = (char**)&arcus_zk_cfg },
+        { .key = "zk_timeout",      .datatype = DT_UINT32, .value.dt_uint32 = (uint32_t*)opt->arcus_zk_to },
+#ifdef PROXY_SUPPORT
+        { .key = "proxy_config",    .datatype = DT_STRING, .value.dt_string = opt->arcus_proxy_cfg },
+#endif
+#endif
+#ifdef SASL_ENABLED
+        { .key = "require_sasl",    .datatype = DT_BOOL,   .value.dt_bool   = &settings.require_sasl },
+#endif
+        { .key = NULL }
+    };
+
+    if (read_config_file(path, main_config_items, stderr) == -1) {
+        mc_logger->log(EXTENSION_LOG_WARNING, NULL, "Error parsing config file. Aborting.\n");
+        return -1;
+    }
+
+    if (settings.verbose > 0) {
+        perform_callbacks(ON_LOG_LEVEL, NULL, NULL);
+    }
+
+    if (access_mask_str != NULL) {
+        settings.access = strtol(access_mask_str, NULL, 8);
+        free(access_mask_str);
+    }
+
+    if (protocol_str != NULL) {
+        if (strcmp(protocol_str, "auto") == 0) {
+            settings.binding_protocol = negotiating_prot;
+        } else if (strcmp(protocol_str, "binary") == 0) {
+            settings.binding_protocol = binary_prot;
+        } else if (strcmp(protocol_str, "ascii") == 0) {
+            settings.binding_protocol = ascii_prot;
+        } else {
+            mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                           "Invalid value for binding protocol in config file: %s\n", protocol_str);
+            free(protocol_str);
+            return -1;
+        }
+        free(protocol_str);
+    }
+
+    if (settings.sticky_limit > 0) {
+        settings.sticky_limit = settings.sticky_limit * 1024 * 1024;
+    }
+
+    for (int i = 0; i < EXTENSION_PATH_MAX_SIZE; i++) {
+        if (extension_path[i] != NULL) {
+            char *ptr = strchr(extension_path[i], ',');
+            if (ptr != NULL) {
+                *ptr = '\0';
+                ptr++;
+            }
+            if (!load_extension(extension_path[i], ptr)) {
+                mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                               "Failed to load extension: %s\n", extension_path[i]);
+                for (int j = 0; j < EXTENSION_PATH_MAX_SIZE; j++)
+                    if (extension_path[j]) free(extension_path[j]);
+                return -1;
+            }
+            free(extension_path[i]);
+        }
+    }
+    if (settings.socketpath != NULL) {
+        opt->config_file_malloced[(*opt->malloced_count)++] = settings.socketpath;
+    }
+    if (settings.username != NULL) {
+        opt->config_file_malloced[(*opt->malloced_count)++] = settings.username;
+    }
+    if (settings.pid_file != NULL) {
+        opt->config_file_malloced[(*opt->malloced_count)++] = settings.pid_file;
+    }
+    if (settings.engine_path != NULL) {
+        opt->config_file_malloced[(*opt->malloced_count)++] = settings.engine_path;
+    }
+    if (settings.engine_config != NULL) {
+        opt->config_file_malloced[(*opt->malloced_count)++] = (char*)settings.engine_config;
+    }
+#ifdef ENABLE_ZK_INTEGRATION
+    if (arcus_zk_cfg != NULL) {
+        opt->config_file_malloced[(*opt->malloced_count)++] = (char*)arcus_zk_cfg;
+    }
+#ifdef PROXY_SUPPORT
+    if (*opt->arcus_proxy_cfg != NULL) {
+        opt->config_file_malloced[(*opt->malloced_count)++] = *opt->arcus_proxy_cfg;
+    }
+#endif
+#endif
+
+    return 0;
+}
+
 int main (int argc, char **argv)
 {
     int c;
-    bool lock_memory = false;
-    bool do_daemonize = false;
-    bool preallocate = false;
-    int maxcore = 0;
-    char *username = NULL;
-    char *pid_file = NULL;
     struct passwd *pw;
     struct rlimit rlim;
     char unit = '\0';
@@ -15871,10 +16020,11 @@ int main (int argc, char **argv)
     bool tcp_specified = false;
     bool udp_specified = false;
 
-    const char *engine = NULL;
-    const char *engine_config = NULL;
     char old_options[1024] = { [0] = '\0' };
     char *old_opts = old_options;
+
+    char *config_file_malloced[10] = { NULL, };
+    int malloced_count = 0;
 
 #ifdef ENABLE_ZK_INTEGRATION
     int  arcus_zk_to=0;
@@ -15896,6 +16046,25 @@ int main (int argc, char **argv)
     if (memcached_initialize_stderr_logger(get_server_api) != EXTENSION_SUCCESS) {
         fprintf(stderr, "Failed to initialize log system\n");
         return EX_OSERR;
+    }
+
+    /* parse config file */
+    if (argc > 1 && argv[1][0] != '-') {
+        const char *config_file = argv[1];
+        config_opt_t opt = {
+            .config_file_malloced = config_file_malloced,
+            .malloced_count = &malloced_count,
+#ifdef ENABLE_ZK_INTEGRATION
+            .arcus_zk_to = &arcus_zk_to,
+#ifdef PROXY_SUPPORT
+            .arcus_proxy_cfg = &arcus_proxy_cfg,
+#endif
+#endif
+        };
+        if (try_load_config_file(config_file, &opt) != 0) {
+            exit(EXIT_FAILURE);
+        }
+        optind++;
     }
 
     /* process arguments */
@@ -15990,20 +16159,21 @@ int main (int argc, char **argv)
             usage_license();
             exit(EXIT_SUCCESS);
         case 'k':
-            lock_memory = true;
+            settings.lock_memory = true;
             break;
         case 'v':
             settings.verbose++;
             perform_callbacks(ON_LOG_LEVEL, NULL, NULL);
             break;
         case 'l':
+            if (settings.inter) free(settings.inter);
             settings.inter = strdup(optarg);
             break;
         case 'd':
-            do_daemonize = true;
+            settings.daemonize = true;
             break;
         case 'r':
-            maxcore = 1;
+            settings.maxcore = 1;
             break;
         case 'R':
             settings.reqs_per_event = atoi(optarg);
@@ -16014,18 +16184,13 @@ int main (int argc, char **argv)
             }
             break;
         case 'u':
-            username = optarg;
+            settings.username = optarg;
             break;
         case 'P':
-            pid_file = optarg;
+            settings.pid_file = optarg;
             break;
         case 'f':
             settings.factor = atof(optarg);
-            if (settings.factor <= 1.0) {
-                mc_logger->log(EXTENSION_LOG_WARNING, NULL,
-                        "Factor must be greater than 1\n");
-                return 1;
-            }
            break;
         case 'n':
             settings.chunk_size = atoi(optarg);
@@ -16060,7 +16225,7 @@ int main (int argc, char **argv)
             break;
         case 'L' :
             if (enable_large_pages() == 0) {
-                preallocate = true;
+                settings.preallocate = true;
             }
             break;
         case 'C' :
@@ -16097,32 +16262,12 @@ int main (int argc, char **argv)
             } else {
                 settings.item_size_max = atoi(optarg);
             }
-            /* small memory allocator needs the maximum item size larger than 20 KB */
-            //if (settings.item_size_max < 1024) {
-            if (settings.item_size_max < 1024 * 20) {
-                mc_logger->log(EXTENSION_LOG_WARNING, NULL,
-                        "Item max size cannot be less than 20KB.\n");
-                return 1;
-            }
-            if (settings.item_size_max > 1024 * 1024 * 128) {
-                mc_logger->log(EXTENSION_LOG_WARNING, NULL,
-                        "Cannot set item size limit higher than 128 mb.\n");
-                return 1;
-            }
-            if (settings.item_size_max > 1024 * 1024) {
-                mc_logger->log(EXTENSION_LOG_WARNING, NULL,
-                    "WARNING: Setting item max size above 1MB is not"
-                    " recommended!\n"
-                    " Raising this limit increases the minimum memory requirements\n"
-                    " and will decrease your memory efficiency.\n"
-                );
-            }
             break;
         case 'E':
-            engine = optarg;
+            settings.engine_path = optarg;
             break;
         case 'e':
-            engine_config = optarg;
+            settings.engine_config = optarg;
             break;
         case 'q':
             settings.allow_detailed = false;
@@ -16162,6 +16307,7 @@ int main (int argc, char **argv)
             break;
 #ifdef PROXY_SUPPORT
         case 'x': /* configure for proxy server */
+            if (arcus_proxy_cfg) free(arcus_proxy_cfg);
             arcus_proxy_cfg = strdup(optarg);
             break;
 #endif
@@ -16173,6 +16319,33 @@ int main (int argc, char **argv)
             return 1;
         }
     }
+
+    /* small memory allocator needs the maximum item size larger than 20 KB */
+    //if (settings.item_size_max < 1024) {
+    if (settings.item_size_max < 1024 * 20) {
+        mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                "Item max size cannot be less than 20KB.\n");
+        return 1;
+    }
+    if (settings.item_size_max > 1024 * 1024 * 128) {
+        mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                "Cannot set item size limit higher than 128 mb.\n");
+        return 1;
+    }
+    if (settings.item_size_max > 1024 * 1024) {
+        mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+            "WARNING: Setting item max size above 1MB is not"
+            " recommended!\n"
+            " Raising this limit increases the minimum memory requirements\n"
+            " and will decrease your memory efficiency.\n"
+        );
+    }
+    if (settings.factor <= 1.0) {
+        mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                "Factor must be greater than 1\n");
+        return 1;
+    }
+
     old_opts += sprintf(old_opts, "num_threads=%lu;", (unsigned long)settings.num_threads);
     old_opts += sprintf(old_opts, "cache_size=%llu;", (unsigned long long)settings.maxbytes);
     if (settings.evict_to_free == 0) {
@@ -16191,7 +16364,7 @@ int main (int argc, char **argv)
     if (settings.prefix_delimiter != ':') {
         old_opts += sprintf(old_opts, "prefix_delimiter=%c;", settings.prefix_delimiter);
     }
-    if (preallocate) {
+    if (settings.preallocate) {
         old_opts += sprintf(old_opts, "preallocate=true;");
     }
     if (settings.use_cas == false) {
@@ -16279,24 +16452,24 @@ int main (int argc, char **argv)
         }
     }
 
-    if (engine_config != NULL && strlen(old_options) > 0) {
+    if (settings.engine_config != NULL && strlen(old_options) > 0) {
         /* If there is -e, just append it to the "old" options that we have
          * accumulated so far.
          */
-        old_opts += sprintf(old_opts, "%s", engine_config);
-        engine_config = NULL; /* So we set it to old_options below... */
+        old_opts += sprintf(old_opts, "%s", settings.engine_config);
+        settings.engine_config = NULL; /* So we set it to old_options below... */
         /*
         settings.extensions.logger->log(EXTENSION_LOG_WARNING, NULL,
                 "ERROR: You can't mix -e with the old options\n");
         return EX_USAGE;
         */
     }
-    if (engine_config == NULL && strlen(old_options) > 0) {
-        engine_config = old_options;
+    if (settings.engine_config == NULL && strlen(old_options) > 0) {
+        settings.engine_config = old_options;
     }
-    mc_logger->log(EXTENSION_LOG_INFO, NULL, "engine config: %s\n", engine_config);
+    mc_logger->log(EXTENSION_LOG_INFO, NULL, "engine config: %s\n", settings.engine_config);
 
-    if (maxcore != 0) {
+    if (settings.maxcore != 0) {
         struct rlimit rlim_new;
         /*
          * First try raising to infinity; if that fails, try bringing
@@ -16373,19 +16546,19 @@ int main (int argc, char **argv)
 
     /* lose root privileges if we have them */
     if (getuid() == 0 || geteuid() == 0) {
-        if (username == 0 || *username == '\0') {
+        if (settings.username == 0 || *settings.username == '\0') {
             mc_logger->log(EXTENSION_LOG_WARNING, NULL,
                     "can't run as root without the -u switch\n");
             exit(EX_USAGE);
         }
-        if ((pw = getpwnam(username)) == 0) {
+        if ((pw = getpwnam(settings.username)) == 0) {
             mc_logger->log(EXTENSION_LOG_WARNING, NULL,
-                    "can't find the user %s to switch to\n", username);
+                    "can't find the user %s to switch to\n", settings.username);
             exit(EX_NOUSER);
         }
         if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
             mc_logger->log(EXTENSION_LOG_WARNING, NULL,
-                    "failed to assume identity of user %s: %s\n", username,
+                    "failed to assume identity of user %s: %s\n", settings.username,
                     strerror(errno));
             exit(EX_OSERR);
         }
@@ -16393,12 +16566,12 @@ int main (int argc, char **argv)
 
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
-    if (do_daemonize) {
+    if (settings.daemonize) {
         if (signal(SIGHUP, SIG_IGN) == SIG_ERR) {
             mc_logger->log(EXTENSION_LOG_WARNING, NULL,
                     "Failed to ignore SIGHUP: %s", strerror(errno));
         }
-        if (daemonize(maxcore, settings.verbose) == -1) {
+        if (daemonize(settings.maxcore, settings.verbose) == -1) {
             mc_logger->log(EXTENSION_LOG_WARNING, NULL,
                     "failed to daemon() in order to daemonize\n");
             exit(EXIT_FAILURE);
@@ -16406,7 +16579,7 @@ int main (int argc, char **argv)
     }
 
     /* lock paged memory if needed */
-    if (lock_memory) {
+    if (settings.lock_memory) {
 #ifdef HAVE_MLOCKALL
         int res = mlockall(MCL_CURRENT | MCL_FUTURE);
         if (res != 0) {
@@ -16431,12 +16604,12 @@ int main (int argc, char **argv)
 
     /* load and initialize the storage engine */
     ENGINE_HANDLE *engine_handle = NULL;
-    if (!load_engine(engine, get_server_api, mc_logger, &engine_handle)) {
+    if (!load_engine(settings.engine_path, get_server_api, mc_logger, &engine_handle)) {
         /* error already reported */
         exit(EXIT_FAILURE);
     }
 
-    if (!init_engine(engine_handle, engine_config, mc_logger)) {
+    if (!init_engine(engine_handle, settings.engine_config, mc_logger)) {
         return false;
     }
 
@@ -16596,8 +16769,8 @@ int main (int argc, char **argv)
     /* Save the PID in the pid file if we're a daemon.
      * Do this after the successful startup of memcached.
      */
-    if (do_daemonize)
-        save_pid(getpid(), pid_file);
+    if (settings.daemonize)
+        save_pid(getpid(), settings.pid_file);
 
     /* enter the event loop */
     event_base_loop(main_base, 0);
@@ -16606,8 +16779,8 @@ int main (int argc, char **argv)
     mc_logger->log(EXTENSION_LOG_INFO, NULL, "Initiating arcus memcached shutdown...\n");
 
     /* 1) remove the PID file if we're a daemon */
-    if (do_daemonize)
-        remove_pidfile(pid_file);
+    if (settings.daemonize)
+        remove_pidfile(settings.pid_file);
 
 #ifdef ENABLE_ZK_INTEGRATION
     /* 2) shutdown arcus ZK connection */
@@ -16681,6 +16854,12 @@ int main (int argc, char **argv)
     /* Clean up strdup() call for bind() address */
     if (settings.inter) {
         free(settings.inter);
+    }
+    for (int i = 0; i < malloced_count; i++) {
+        if (config_file_malloced[i] != NULL) {
+            free(config_file_malloced[i]);
+            config_file_malloced[i] = NULL;
+        }
     }
 
     event_base_free(main_base);
